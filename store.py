@@ -15,6 +15,10 @@ rest of the project if they were wrong:
    `sentence-transformers`. It is the same model — `all-MiniLM-L6-v2`, 384
    dimensions — but it arrives as an ONNX build from Chroma's own CDN, so the
    install needs neither PyTorch nor a reachable Hugging Face. See `_embedder`.
+
+4. `search_hybrid` combines semantic search with BM25 keyword search. This is
+   the improvement implemented in Unit 2 to help with questions containing
+   exact terms, names, or numbers that semantic search might miss.
 """
 
 import os
@@ -218,6 +222,103 @@ def search(
             )
         )
     return results
+
+
+def search_hybrid(
+    question: str,
+    top_k: int | None = None,
+    corpus: str | None = None,
+    variant: str = "default",
+    semantic_weight: float = 0.7,
+) -> list[Result]:
+    """
+    Hybrid search combining semantic and BM25 keyword search.
+
+    This is the Unit 2 improvement. It ranks chunks by combining:
+    - Semantic similarity (cosine distance from embeddings)
+    - Keyword relevance (BM25 score)
+
+    The semantic_weight parameter controls the balance:
+    - 1.0 = pure semantic search (same as `search`)
+    - 0.0 = pure keyword search
+    - 0.7 = 70% semantic, 30% keyword (default)
+
+    Returns them ranked by combined score, each with its semantic distance.
+    """
+    top_k = top_k or config.TOP_K
+    name = config.collection_name(corpus, variant)
+
+    try:
+        collection = _client().get_collection(name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"No index called '{name}'. Run `python app.py index` first."
+        ) from exc
+
+    # Get semantic results
+    raw = collection.query(
+        query_embeddings=embed([question]),
+        n_results=min(top_k * 2, collection.count()),  # Get more to re-rank
+    )
+
+    # Build BM25 index from all chunks
+    from rank_bm25 import BM25Okapi
+    import string
+
+    all_chunks = collection.get()
+    tokenized_corpus = [
+        [word.lower().strip(string.punctuation) for word in doc.split()]
+        for doc in all_chunks["documents"]
+    ]
+    bm25 = BM25Okapi(tokenized_corpus)
+
+    # Score query with BM25
+    tokenized_query = [
+        word.lower().strip(string.punctuation) for word in question.split()
+    ]
+    bm25_scores = bm25.get_scores(tokenized_query)
+
+    # Combine scores
+    combined_results = []
+    for i, (text, meta, distance) in enumerate(
+        zip(raw["documents"][0], raw["metadatas"][0], raw["distances"][0])
+    ):
+        # Find the BM25 score for this chunk
+        chunk_id = f"{meta.get('source', 'unknown')}#{meta.get('index', 0)}"
+        chunk_index = all_chunks["ids"].index(chunk_id)
+        bm25_score = bm25_scores[chunk_index]
+
+        # Normalize BM25 score to 0-1 range
+        max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1
+        normalized_bm25 = bm25_score / max_bm25
+
+        # Convert cosine distance to similarity (1 - distance)
+        semantic_similarity = 1 - distance
+
+        # Combine: weighted average of semantic similarity and BM25
+        combined_score = (
+            semantic_weight * semantic_similarity +
+            (1 - semantic_weight) * normalized_bm25
+        )
+
+        combined_results.append(
+            Result(
+                text=text,
+                source=str(meta.get("source", "unknown")),
+                label=f"{meta.get('source', 'unknown')}#{meta.get('index', 0)}",
+                distance=float(distance),  # Keep original semantic distance
+                produced_by=str(meta.get("produced_by", "unknown")),
+            )
+        )
+        # Store combined score temporarily for sorting
+        combined_results[-1].__dict__["_combined_score"] = combined_score
+
+    # Sort by combined score and return top_k
+    combined_results.sort(key=lambda r: r.__dict__["_combined_score"], reverse=True)
+    for r in combined_results:
+        del r.__dict__["_combined_score"]
+
+    return combined_results[:top_k]
 
 
 def index_exists(corpus: str | None = None, variant: str = "default") -> bool:
